@@ -1,7 +1,6 @@
 import sqlite3
 import requests
 import asyncio
-import logging
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -15,101 +14,100 @@ NVIDIA_API_KEY = "nvapi-5rP8Zjb1UGhIrN2RM-Dszoi02DgI4WnKeu449fHCtAs2Dsu5tsswaBAd
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL_NAME = "meta/llama-3.1-405b-instruct"
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-# --- DUMMY SERVER FOR RENDER ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-
-def run_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    print(f"Health check server started on port {port}")
-    server.serve_forever()
-
-# --- SQL DATABASE ---
+# --- DATABASE LOGIC ---
 def init_db():
-    conn = sqlite3.connect('bestie_chats.db')
+    conn = sqlite3.connect('bestie_memory.db')
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS history 
-                     (user_id INTEGER, name TEXT, msg TEXT, reply TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS chats 
+                     (user_id BIGINT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
     conn.commit()
     conn.close()
 
-def save_to_sql(user_id, name, msg, reply):
-    conn = sqlite3.connect('bestie_chats.db')
+def save_to_db(user_id, role, content):
+    conn = sqlite3.connect('bestie_memory.db')
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO history (user_id, name, msg, reply) VALUES (?, ?, ?, ?)", 
-                   (user_id, name, msg, reply))
+    cursor.execute("INSERT INTO chats (user_id, role, content) VALUES (?, ?, ?)", (user_id, role, content))
     conn.commit()
     conn.close()
 
-# --- AI REPLY SYNC ---
-def get_ai_reply_sync(user_text):
+def get_history(user_id, limit=20):
+    conn = sqlite3.connect('bestie_memory.db')
+    cursor = conn.cursor()
+    # Pichle 20 messages uthayenge
+    cursor.execute("SELECT role, content FROM chats WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", (user_id, limit))
+    rows = cursor.fetchall()
+    conn.close()
+    # Reverse karke wapas bhejna (taaki oldest se newest order ho)
+    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+# --- AI LOGIC ---
+def ask_ai(user_id, user_msg):
+    # 1. History load karo
+    history = get_history(user_id)
+    
+    # 2. Messages array taiyar karo
+    messages = [
+        {"role": "system", "content": "Tu user ki female best friend hai. Hinglish bol. Pichli 20 baatein yaad rakh aur unke basis par natural reply de. Agar user kuch purana puche toh database se dekh kar bata."}
+    ]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_msg})
+
     headers = {"Authorization": f"Bearer {NVIDIA_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": "Tu ek cute female best friend hai. Hinglish bol. Short reply de."},
-            {"role": "user", "content": user_text}
-        ],
-        "temperature": 0.7, "max_tokens": 150
-    }
+    payload = {"model": MODEL_NAME, "messages": messages, "temperature": 0.7, "max_tokens": 200}
+
     try:
-        response = requests.post(API_URL, headers=headers, json=payload, timeout=20)
-        return response.json()['choices'][0]['message']['content'] if response.status_code == 200 else "Mood off hai yaar!"
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=25)
+        if response.status_code == 200:
+            ai_reply = response.json()['choices'][0]['message']['content']
+            # Save both messages to DB
+            save_to_db(user_id, "user", user_msg)
+            save_to_db(user_id, "assistant", ai_reply)
+            return ai_reply
+        return "Yaar, dimag kaam nahi kar raha mera abhi (API Error)."
     except:
-        return "Net issue hai, thoda wait kar!"
+        return "Net issue hai shayad, phir se bol?"
 
-# --- TYPING HELPER ---
-async def keep_typing(context, chat_id, stop_event):
-    while not stop_event.is_set():
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        await asyncio.sleep(4)
-
-# --- MESSAGE HANDLER ---
+# --- TELEGRAM HANDLER ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_msg = update.message.text
     user_id = update.message.from_user.id
-    user_name = update.message.from_user.first_name
+    user_text = update.message.text
+    chat_id = update.effective_chat.id
 
+    # Continuous Typing
     stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(keep_typing(context, chat_id, stop_typing))
+    async def typing_loop():
+        while not stop_typing.is_set():
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await asyncio.sleep(4)
+    
+    t_task = asyncio.create_task(typing_loop())
 
     try:
         loop = asyncio.get_running_loop()
-        bot_reply = await loop.run_in_executor(None, get_ai_reply_sync, user_msg)
+        reply = await loop.run_in_executor(None, ask_ai, user_id, user_text)
     finally:
         stop_typing.set()
-        await typing_task
+        await t_task
 
-    save_to_sql(user_id, user_name, user_msg, bot_reply)
-    await update.message.reply_text(bot_reply)
+    await update.message.reply_text(reply)
 
-# --- MAIN ASYNC RUNNER ---
+# --- RENDER PORT FIX ---
+class HealthCheck(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+
+def run_server():
+    httpd = HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 10000))), HealthCheck)
+    httpd.serve_forever()
+
 async def main():
     init_db()
-    # Health server thread mein hi rahega
-    threading.Thread(target=run_health_server, daemon=True).start()
-    
-    print("Bot is starting with Event Loop Fix... 🚀")
+    threading.Thread(target=run_server, daemon=True).start()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Manually starting polling instead of run_polling to avoid loop issues
     async with app:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        # Keep the bot running
+        await app.initialize(); await app.start(); await app.updater.start_polling()
         await asyncio.Event().wait()
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    asyncio.run(main())
