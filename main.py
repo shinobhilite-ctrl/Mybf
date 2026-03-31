@@ -3,8 +3,8 @@ import requests
 import asyncio
 import logging
 import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -17,7 +17,7 @@ MODEL_NAME = "meta/llama-3.1-405b-instruct"
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- DUMMY SERVER FOR RENDER (Port Fix) ---
+# --- DUMMY SERVER FOR RENDER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -25,7 +25,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is alive!")
 
 def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     print(f"Health check server started on port {port}")
     server.serve_forever()
@@ -53,7 +53,7 @@ def get_ai_reply_sync(user_text):
     payload = {
         "model": MODEL_NAME,
         "messages": [
-            {"role": "system", "content": "Tu ek cute female best friend hai. Hinglish bol. Short reply de. Thoda mazaak kar."},
+            {"role": "system", "content": "Tu ek cute female best friend hai. Hinglish bol. Short reply de."},
             {"role": "user", "content": user_text}
         ],
         "temperature": 0.7, "max_tokens": 150
@@ -81,7 +81,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     typing_task = asyncio.create_task(keep_typing(context, chat_id, stop_typing))
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         bot_reply = await loop.run_in_executor(None, get_ai_reply_sync, user_msg)
     finally:
         stop_typing.set()
@@ -90,13 +90,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_to_sql(user_id, user_name, user_msg, bot_reply)
     await update.message.reply_text(bot_reply)
 
-# --- MAIN ---
-if __name__ == '__main__':
+# --- MAIN ASYNC RUNNER ---
+async def main():
     init_db()
-    # Health server ko background thread mein chalayein
+    # Health server thread mein hi rahega
     threading.Thread(target=run_health_server, daemon=True).start()
     
-    print("Bot is starting with Port Fix... 🚀")
+    print("Bot is starting with Event Loop Fix... 🚀")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    
+    # Manually starting polling instead of run_polling to avoid loop issues
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        # Keep the bot running
+        await asyncio.Event().wait()
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
